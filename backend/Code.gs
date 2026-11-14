@@ -7,15 +7,22 @@
  * Propriétés du script (Paramètres du projet > Propriétés du script) :
  *   BIBLIO_DOSSIER : identifiant du dossier Drive racine (la fin de son adresse dans Drive).
  *   SCOUTHUB_API   : adresse /exec du serveur ScoutHub, qui vérifie les sessions (action « me »).
+ *   GITHUB_TOKEN, DATA_REPO : (facultatif mais conseillé) copie de la bibliothèque dans le dépôt GitHub PRIVÉ « organisation/depot » (dossier bibliotheque/),
+ *                    synchronisée avec le Drive : jeton fine-grained limité à ce dépôt, « Contents : lecture/écriture ». Jamais un dépôt public.
  *   CLE_PARTAGEE   : (facultatif) mot de passe partagé avec ChatGDB (même valeur que BIBLIO_CLE côté ScoutHub) : ChatGDB peut alors
  *                    chercher et lire les documents pour répondre aux questions.
  *
  * Accès par rubrique : dans la description d'un dossier Drive, écrire une ligne « acces: chef_unite » (membre, parent, chef_unite,
  * chef_groupe ou admin) pour réserver ce dossier et tout ce qu'il contient à ce rôle et aux rôles supérieurs. Sans ligne : tous les comptes.
  * Un dossier dont le nom commence par « _ » est ignoré.
+ *
+ * Dépôt de documents : l'administrateur (depuis ChatGDB, ou l'action « deposer ») ajoute un fichier ou un document rédigé ; il est créé dans Drive
+ * (rubriques créées au besoin) ET copié dans GitHub. Pour les PDF scannés trop lourds pour être lus d'un bloc, activer le service avancé « Drive API »
+ * (Services > Drive API, v2) : le texte est alors extrait par reconnaissance de caractères.
+ * Déclencheur conseillé : fonction « synchroniserGithub », une fois par jour (copie dans GitHub ce qui a changé dans Drive).
  */
 var ROLES = ['membre', 'parent', 'chef_unite', 'chef_groupe', 'admin'];
-var MAX_FICHIERS = 3000, MAX_OCTETS = 8 * 1024 * 1024, DUREE_INDEX = 600;
+var MAX_FICHIERS = 3000, MAX_OCTETS = 8 * 1024 * 1024, MAX_DEPOT = 25 * 1024 * 1024, MAX_LECTURE = 15 * 1024 * 1024, DUREE_INDEX = 600;
 
 function doGet() { return ContentService.createTextOutput(JSON.stringify({ ok: true, service: 'ScoutBibliotheque' })).setMimeType(ContentService.MimeType.JSON); }
 function doPost(e) {
@@ -60,7 +67,11 @@ var ACTIONS = {
   lire: function (r, a) {
     var f = fichier_(r.id, a), t = f.type;
     var file = DriveApp.getFileById(f.id), mime = file.getMimeType();
-    if (mime === 'application/pdf') { if (file.getSize() > MAX_OCTETS) fail_('PDF trop volumineux pour être lu (8 Mo au plus).'); return { ok: true, titre: f.nom, pdf: Utilities.base64Encode(file.getBlob().getBytes()) }; }
+    if (mime === 'application/pdf') {
+      if (file.getSize() <= MAX_LECTURE) return { ok: true, titre: f.nom, pdf: Utilities.base64Encode(file.getBlob().getBytes()) };
+      return { ok: true, titre: f.nom, texte: texteGrosPdf_(file) };                  // trop lourd pour être transmis d'un bloc : texte extrait
+    }
+    if (/^image\//.test(mime)) { if (file.getSize() > 3.5 * 1024 * 1024) fail_('Image trop lourde pour être lue (3,5 Mo au plus).'); return { ok: true, titre: f.nom, image: Utilities.base64Encode(file.getBlob().getBytes()), mime: mime }; }
     if (mime === 'application/vnd.google-apps.document') return { ok: true, titre: f.nom, texte: DocumentApp.openById(f.id).getBody().getText().slice(0, 60000) };
     if (mime === 'application/vnd.google-apps.spreadsheet') { var feuille = SpreadsheetApp.openById(f.id).getSheets()[0]; return { ok: true, titre: f.nom, texte: feuille.getDataRange().getDisplayValues().slice(0, 500).map(function (l) { return l.join('\t'); }).join('\n') }; }
     if (/^text\//.test(mime) || /json|xml|csv/.test(mime)) return { ok: true, titre: f.nom, texte: file.getBlob().getDataAsString('UTF-8').slice(0, 60000) };
@@ -75,6 +86,28 @@ var ACTIONS = {
     }
     if (file.getSize() > MAX_OCTETS) fail_('Fichier trop volumineux pour le téléchargement direct (8 Mo au plus).');
     return { ok: true, nom: nom, mime: mime, base64: Utilities.base64Encode(file.getBlob().getBytes()) };
+  },
+  // Dépôt (administrateur) : fichier envoyé, ou document rédigé (html converti en PDF). Drive ET GitHub.
+  deposer: function (r, a) {
+    if (a.role !== 'admin') fail_('Réservé à l\'administrateur.');
+    var nom = String(r.nom || '').trim().replace(/[\\/:*?"<>|\u0000-\u001f]+/g, ' ').slice(0, 150);
+    if (!nom || nom.charAt(0) === '.' || nom.charAt(0) === '_') fail_('Nom de fichier invalide.');
+    var segments = String(r.chemin || '').split('/').map(function (x) { return x.trim().replace(/[\\:*?"<>|\u0000-\u001f]+/g, ' '); }).filter(String);
+    if (segments.length > 6 || segments.some(function (x) { return x.length > 100 || x.charAt(0) === '_' || x.charAt(0) === '.'; })) fail_('Rubrique invalide.');
+    var blob;
+    if (r.html) { if (!/\.pdf$/i.test(nom)) nom += '.pdf'; blob = Utilities.newBlob(String(r.html).slice(0, 2000000), 'text/html', 'document.html').getAs('application/pdf').setName(nom); }
+    else {
+      if (typeof r.base64 !== 'string' || r.base64.length < 8) fail_('Fichier vide.');
+      if (r.base64.length > MAX_DEPOT * 1.4) fail_('Fichier trop volumineux (25 Mo au plus).');
+      blob = Utilities.newBlob(Utilities.base64Decode(r.base64), String(r.mime || 'application/octet-stream').slice(0, 100), nom);
+    }
+    if (blob.getBytes().length > MAX_DEPOT) fail_('Fichier trop volumineux (25 Mo au plus).');
+    var dossier = DriveApp.getFolderById(PropertiesService.getScriptProperties().getProperty('BIBLIO_DOSSIER') || fail_('Dossier de la bibliothèque non configuré.'));
+    segments.forEach(function (nomD) { var it = dossier.getFoldersByName(nomD); dossier = it.hasNext() ? it.next() : dossier.createFolder(nomD); });
+    var anciens = dossier.getFilesByName(nom), remplace = false; while (anciens.hasNext()) { anciens.next().setTrashed(true); remplace = true; }
+    var file = dossier.createFile(blob); CacheService.getScriptCache().removeAll(['bi:n']);
+    var gh = githubEnvoyer_(segments.concat([nom]).join('/'), file.getId(), blob, 'Bibliothèque : ' + (remplace ? 'mise à jour de ' : 'ajout de ') + nom);
+    return { ok: true, id: file.getId(), nom: nom, chemin: segments.join('/'), remplace: remplace, github: gh, taille: blob.getBytes().length };
   },
   // Reconstruit l'index tout de suite (administrateur ou clé partagée).
   reindexer: function (r, a) { if (a.role !== 'admin') fail_('Réservé à l\'administrateur.'); CacheService.getScriptCache().removeAll(['bi:n']); var i = index_(true); return { ok: true, fichiers: i.fichiers.length, dossiers: Object.keys(i.dossiers).length }; }
@@ -155,3 +188,57 @@ function norm_(t) { return String(t || '').toLowerCase().normalize('NFD').replac
 function sha_(s) { return Utilities.computeDigest(Utilities.DigestAlgorithm.SHA_256, s, Utilities.Charset.UTF_8).map(function (b) { return ('0' + (b & 0xff).toString(16)).slice(-2); }).join('').slice(0, 24); }
 function json_(o) { return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }
 function fail_(msg) { var e = new Error(msg); e.userMessage = msg; throw e; }
+
+// ---------- copie GitHub (dépôt de données PRIVÉ) : bibliotheque/<rubrique>/<fichier> + manifest.json ----------
+function githubPret_() { var p = PropertiesService.getScriptProperties(); return !!(p.getProperty('GITHUB_TOKEN') && p.getProperty('DATA_REPO')); }
+function gh_(methode, chemin, corps) {
+  var p = PropertiesService.getScriptProperties(), opt = { method: methode, muteHttpExceptions: true, headers: { Authorization: 'Bearer ' + p.getProperty('GITHUB_TOKEN'), Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'ScoutBibliotheque' } };
+  if (corps) { opt.contentType = 'application/json'; opt.payload = JSON.stringify(corps); }
+  var res = UrlFetchApp.fetch('https://api.github.com/repos/' + p.getProperty('DATA_REPO') + '/contents/' + chemin, opt);
+  return { code: res.getResponseCode(), json: (function () { try { return JSON.parse(res.getContentText()); } catch (e) { return {}; } })() };
+}
+function cheminGh_(chemin) { return 'bibliotheque/' + chemin.split('/').map(encodeURIComponent).join('/'); }
+// Renvoie true si la copie GitHub est faite, false si GitHub n'est pas configuré ou refuse (le fichier reste dans Drive).
+function githubEnvoyer_(chemin, driveId, blob, message) {
+  if (!githubPret_()) return false;
+  try {
+    var cur = gh_('get', cheminGh_(chemin)), corps = { message: message, content: Utilities.base64Encode(blob.getBytes()) };
+    if (cur.code === 200 && cur.json.sha) corps.sha = cur.json.sha;
+    var res = gh_('put', cheminGh_(chemin), corps);
+    if (res.code !== 200 && res.code !== 201) return false;
+    manifest_(function (m) { m[driveId] = { chemin: chemin, taille: blob.getBytes().length, maj: Date.now() }; });
+    return true;
+  } catch (e) { return false; }
+}
+function manifest_(modifier) {
+  var cur = gh_('get', 'bibliotheque/manifest.json'), m = {}, sha;
+  if (cur.code === 200) { sha = cur.json.sha; try { m = JSON.parse(Utilities.newBlob(Utilities.base64Decode(String(cur.json.content).replace(/\n/g, ''))).getDataAsString('UTF-8')); } catch (e) { m = {}; } }
+  modifier(m);
+  var corps = { message: 'Bibliothèque : manifeste', content: Utilities.base64Encode(Utilities.newBlob(JSON.stringify(m, null, 1)).getBytes()) };
+  if (sha) corps.sha = sha; gh_('put', 'bibliotheque/manifest.json', corps);
+}
+// Copie dans GitHub tout ce qui est nouveau ou modifié dans Drive (déclencheur quotidien). Traite quelques fichiers par passage.
+function synchroniserGithub() {
+  if (!githubPret_()) return 'GitHub non configuré.';
+  var idx = index_(true), cur = gh_('get', 'bibliotheque/manifest.json'), m = {};
+  if (cur.code === 200) { try { m = JSON.parse(Utilities.newBlob(Utilities.base64Decode(String(cur.json.content).replace(/\n/g, ''))).getDataAsString('UTF-8')); } catch (e) { m = {}; } }
+  var faits = 0, debut = Date.now();
+  idx.fichiers.forEach(function (f) {
+    if (faits >= 8 || Date.now() - debut > 240000) return;
+    var v = m[f.id]; if (v && v.maj >= f.maj) return;
+    var file = DriveApp.getFileById(f.id), mime = file.getMimeType(), blob;
+    if (file.getSize() > MAX_DEPOT) return;
+    try { blob = /^application\/vnd\.google-apps\./.test(mime) ? file.getAs('application/pdf') : file.getBlob(); } catch (e) { return; }
+    var chemin = (chemin_(idx, f.dossier) ? chemin_(idx, f.dossier) + '/' : '') + f.nom + (/^application\/vnd\.google-apps\./.test(mime) ? '.pdf' : '');
+    if (githubEnvoyer_(chemin, f.id, blob, 'Bibliothèque : synchronisation de ' + f.nom)) faits++;
+  });
+  return faits + ' fichier(s) copié(s) dans GitHub.';
+}
+// PDF trop lourd pour être lu d'un bloc : texte par reconnaissance de caractères (service avancé Drive), mis en cache dans Drive à côté du fichier.
+function texteGrosPdf_(file) {
+  var cache = CacheService.getScriptCache(), cle = 'ocr:' + file.getId(), hit = cache.get(cle); if (hit) return hit;
+  if (typeof Drive === 'undefined') fail_('PDF trop volumineux pour être lu d\'un bloc : activez le service avancé « Drive API » du projet Apps Script pour en extraire le texte.');
+  var tmp = Drive.Files.insert({ title: 'ocr-' + file.getName(), mimeType: 'application/vnd.google-apps.document' }, file.getBlob(), { ocr: true, ocrLanguage: 'fr' });
+  try { var txt = DocumentApp.openById(tmp.id).getBody().getText().slice(0, 120000); try { cache.put(cle, txt.slice(0, 90000), 21600); } catch (e) { /* trop gros */ } return txt; }
+  finally { try { DriveApp.getFileById(tmp.id).setTrashed(true); } catch (e) { /* ignore */ } }
+}

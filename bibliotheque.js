@@ -9,7 +9,7 @@
   let mode = (() => { try { return localStorage.getItem("biblio.mode") || "grid"; } catch { return "grid"; } })(), current = "", timer = 0, viewing = null;
 
   async function call(action, data = {}) {
-    const API = window.BIBLIO_API; if (!API) throw new Error("La bibliothèque n’est pas encore configurée (config.js).");
+    const API = window.BIBLIO_API; if (!API) throw new Error("La bibliothèque sera bientôt disponible.");
     let res; try { res = await fetch(API, { method: "POST", headers: { "Content-Type": "text/plain;charset=utf-8" }, body: JSON.stringify({ action, token: Hub.token, ...data }) }); } catch { throw new Error("Serveur injoignable."); }
     let out; try { out = await res.json(); } catch { throw new Error("Réponse invalide du serveur."); }
     if (!out.ok) { if (/Session expirée|Connexion requise/.test(out.error)) { Hub.store.set(null); showGate(); } throw new Error(out.error || "Erreur."); }
